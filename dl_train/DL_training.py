@@ -35,7 +35,7 @@ print("Train a classifier of type {} with index {}".format(model_type, kk))
 # kk = 1
 
 # Set size of training library and length of time series
-(lib_size, ts_len) = (100000/2, 500)  # Or (500000, 500) for the 500-classifier
+(lib_size, ts_len) = (1000, 500)  # Or (500000, 500) for the 500-classifier
 
 # keeps track of training metrics
 f1_name = "training_results_{}_{}.txt".format(kk, model_type)

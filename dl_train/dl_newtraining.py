@@ -8,7 +8,7 @@ CNN_layers = 1
 LSTM_layers = 1
 pool_size_param = 2
 learning_rate_param = 0.0005
-batch_param = 1000
+batch_param = 100
 dropout_percent = 0.10
 filters_param = 50
 mem_cells = 50
@@ -33,9 +33,10 @@ class testClassifier(nn.Module):
         )
 
     def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x=self.dropout(x)
-        return self.net(x)
+        x = torch.relu(self.net[0](x))
+        x = self.net[1](x)
+        x = self.net[2](x)
+        return self.net[3](x)
 
 model = testClassifier(input_dim=DL.ts_len).to(device)
 
@@ -80,7 +81,7 @@ for epoch in range(epoch_param):
         if epoch_loss < best_test_loss:
                 best_test_loss = epoch_loss
                 epochs_no_improve = 0
-                # Optional but highly recommended: Save the best model state!
+                # Save the best model state
                 torch.save(model.state_dict(), 'best_model.pth')
         else:
             epochs_no_improve += 1

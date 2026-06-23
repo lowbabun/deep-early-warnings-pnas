@@ -91,14 +91,14 @@ for j in range(numSims):
 
     # Run burn-in period on x0
     for i in range(int(tburn / dt)):
-        x0 = x0 + de_fun(x0, r, k, b[0], s) * dt + dW_burn[i]
+        x0 = x0 + de_fun(x0, r, k, b[0], s) * dt + dW_burn[i] 
 
     # Initial condition post burn-in period
     x[0] = x0
 
     # Run simulation
     for i in range(len(t) - 1):
-        x[i + 1] = x[i] + de_fun(x[i], r, k, b.iloc[i], s) * dt + dW[i]
+        x[i + 1] = x[i] + de_fun(x[i], r, k, b.iloc[i], s) * dt + dW[i] # Euler-Maruyama update
         # make sure that state variable remains >= 0
         if x[i + 1] < 0:
             x[i + 1] = 0
