@@ -25,3 +25,11 @@ dl_train/training_results_1_1.csv
 dl_train/training_results_1_1.txt
 training_results_1_1.csv
 training_results_1_1.txt
+
+# model checkpoints
+best_model.pth
+*.pth
+
+# eval plots (also build artifacts)
+confusion_matrix.png
+eval_plots/

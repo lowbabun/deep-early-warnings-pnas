@@ -47,6 +47,8 @@ def train_chronos2(
     logging_steps: int = 100,
     save_dir: str = "chronos2_lora_adapter",
     device_map: str | None = None,
+    context_length: int | None = None, #how much the data it looks at
+    
 ):
     """
     Fine-tune Chronos-2 with LoRA using the pipeline's built-in `fit` method.

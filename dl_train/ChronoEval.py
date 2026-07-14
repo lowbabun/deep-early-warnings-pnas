@@ -17,6 +17,7 @@ Usage:
 import json
 import os
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from chronos import BaseChronosPipeline
@@ -115,20 +116,58 @@ def compare_forecasts(
     Runs both pipelines over every (context, target) pair and reports mean
     absolute error (MAE) for each, plus the per-series breakdown so you can
     see if fine-tuning helps some series more than others.
+
+    Also returns the raw per-series quantile predictions (low/median/high)
+    for both models so they can be plotted without re-running inference.
     """
     base_errors = []
     ft_errors = []
+    base_quantiles_all = []  # list of (prediction_length, num_quantiles) arrays
+    ft_quantiles_all = []
 
     for i in range(len(contexts)):
         context = np.asarray(contexts[i], dtype=np.float32)
         truth = np.asarray(targets[i], dtype=np.float32)
 
-        _, base_mean = base_pipeline.predict_quantiles(
+        base_q, base_mean = base_pipeline.predict_quantiles(
             [context], prediction_length=prediction_length, quantile_levels=list(quantile_levels)
         )
-        _, ft_mean = finetuned_pipeline.predict_quantiles(
+        ft_q, ft_mean = finetuned_pipeline.predict_quantiles(
             [context], prediction_length=prediction_length, quantile_levels=list(quantile_levels)
         )
+
+        base_q_arr = np.asarray(base_q[0])
+        ft_q_arr = np.asarray(ft_q[0])
+
+        # base_q[0] is expected to already be (prediction_length, num_quantiles)
+        # after stripping the batch dim, since predict_quantiles takes a batch
+        # of size 1 here ([context]). In practice this version of the pipeline
+        # returns base_q[0] still carrying a leading singleton dim, i.e.
+        # (1, prediction_length, num_quantiles). Squeeze out any leading axis
+        # of size 1 until we hit the real (prediction_length, num_quantiles)
+        # shape, rather than assuming a fixed number of dims.
+        while base_q_arr.ndim > 2 and base_q_arr.shape[0] == 1:
+            base_q_arr = base_q_arr[0]
+        while ft_q_arr.ndim > 2 and ft_q_arr.shape[0] == 1:
+            ft_q_arr = ft_q_arr[0]
+
+        if i == 0:
+            # One-time shape check, run after the leading-dim squeeze above.
+            # Earlier debugging showed predict_quantiles([context], ...)
+            # returns base_q[0] as (1, prediction_length, num_quantiles) -
+            # i.e. an extra leading singleton dim beyond what [0] alone
+            # strips - for BOTH base and fine-tuned pipelines identically.
+            # Not a PeftModel-specific issue; just an extra batch-like axis
+            # in this pipeline version's per-series tensor. The squeeze loop
+            # above handles it, so this check should now always pass.
+            expected_shape = (prediction_length, len(quantile_levels))
+            print(f"  [debug] expected per-series quantile shape: {expected_shape}")
+            print(f"  [debug] base_pipeline shape after squeeze:      {base_q_arr.shape}")
+            print(f"  [debug] finetuned_pipeline shape after squeeze: {ft_q_arr.shape}")
+            if base_q_arr.shape != expected_shape:
+                print("  [debug] -> BASE pipeline shape STILL mismatched after squeeze!")
+            if ft_q_arr.shape != expected_shape:
+                print("  [debug] -> FINETUNED pipeline shape STILL mismatched after squeeze!")
 
         base_pred = base_mean[0].numpy().reshape(-1)
         ft_pred = ft_mean[0].numpy().reshape(-1)
@@ -136,10 +175,118 @@ def compare_forecasts(
         base_errors.append(np.abs(base_pred - truth).mean())
         ft_errors.append(np.abs(ft_pred - truth).mean())
 
+        base_quantiles_all.append(base_q_arr)
+        ft_quantiles_all.append(ft_q_arr)
+
     base_errors = np.array(base_errors)
     ft_errors = np.array(ft_errors)
 
-    return base_errors, ft_errors
+    return base_errors, ft_errors, base_quantiles_all, ft_quantiles_all
+
+
+def plot_series_forecast(
+    context: np.ndarray,
+    truth: np.ndarray,
+    base_quantiles: np.ndarray,
+    ft_quantiles: np.ndarray,
+    quantile_levels,
+    series_idx: int,
+    out_dir: str,
+):
+    """
+    Plots one series: historical context, ground-truth future, and both
+    models' forecasts (median line + low/high quantile shaded band).
+    Saves to out_dir/series_{idx}.png.
+    """
+    context_len = len(context)
+    pred_len = len(truth)
+
+    x_context = np.arange(context_len)
+    x_future = np.arange(context_len, context_len + pred_len)
+
+    low_idx, median_idx, high_idx = 0, len(quantile_levels) // 2, len(quantile_levels) - 1
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(x_context, context, color="black", label="Context (history)")
+    ax.plot(x_future, truth, color="black", linestyle="--", marker="o", markersize=3, label="Ground truth")
+
+    def _plot_model(quantiles, color, label):
+        # Defensive: predict_quantiles should return one row per forecast
+        # step, but if a pipeline returns a different length (e.g. collapsed
+        # to 1 step due to a wrapping issue), don't crash the whole eval run -
+        # plot what we can and flag it visibly instead.
+        if quantiles.shape[0] != pred_len:
+            ax.text(
+                x_future[0],
+                ax.get_ylim()[1] if ax.get_ylim()[1] != ax.get_ylim()[0] else 1.0,
+                f"{label}: shape mismatch {quantiles.shape}, skipped",
+                color=color,
+                fontsize=8,
+                va="top",
+            )
+            print(f"  [plot warning] {label} quantiles shape {quantiles.shape} != expected ({pred_len}, {len(quantile_levels)}); skipping this curve")
+            return
+        ax.plot(x_future, quantiles[:, median_idx], color=color, label=f"{label} (median)")
+        ax.fill_between(
+            x_future,
+            quantiles[:, low_idx],
+            quantiles[:, high_idx],
+            color=color,
+            alpha=0.15,
+            label=f"{label} {int(quantile_levels[low_idx]*100)}-{int(quantile_levels[high_idx]*100)}% band",
+        )
+
+    _plot_model(base_quantiles, "tab:blue", "Base model")
+    _plot_model(ft_quantiles, "tab:orange", "Fine-tuned model")
+
+    ax.axvline(context_len - 0.5, color="gray", linestyle=":", linewidth=1)
+    ax.set_title(f"Series {series_idx}: base vs fine-tuned forecast")
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Value")
+    ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"series_{series_idx:03d}.png")
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def plot_error_summary(base_errors: np.ndarray, ft_errors: np.ndarray, out_dir: str):
+    """
+    Two-panel summary: (1) MAE per series for base vs fine-tuned as paired bars,
+    (2) histogram of the error distributions. Saves to out_dir/error_summary.png.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Panel 1: per-series paired comparison
+    idx = np.arange(len(base_errors))
+    width = 0.4
+    axes[0].bar(idx - width / 2, base_errors, width=width, color="tab:blue", label="Base")
+    axes[0].bar(idx + width / 2, ft_errors, width=width, color="tab:orange", label="Fine-tuned")
+    axes[0].set_xlabel("Series index")
+    axes[0].set_ylabel("MAE")
+    axes[0].set_title("Per-series MAE: base vs fine-tuned")
+    axes[0].legend()
+
+    # Panel 2: error distribution
+    axes[1].hist(base_errors, bins=15, alpha=0.5, color="tab:blue", label="Base")
+    axes[1].hist(ft_errors, bins=15, alpha=0.5, color="tab:orange", label="Fine-tuned")
+    axes[1].axvline(base_errors.mean(), color="tab:blue", linestyle="--", linewidth=1)
+    axes[1].axvline(ft_errors.mean(), color="tab:orange", linestyle="--", linewidth=1)
+    axes[1].set_xlabel("MAE")
+    axes[1].set_ylabel("Number of series")
+    axes[1].set_title("Error distribution across all series")
+    axes[1].legend()
+
+    fig.tight_layout()
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "error_summary.png")
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
 
 
 if __name__ == "__main__":
@@ -147,6 +294,11 @@ if __name__ == "__main__":
     # --- Config: point this at the folder your training script saved to ---
     BASE_MODEL_NAME = "amazon/chronos-2"
     FINETUNED_DIR = "chronos2_lora_adapter"  # or "chronos-2-finetuned"
+    PLOT_DIR = "eval_plots"
+    MAX_SERIES_TO_PLOT = 10  # only plot the first N series individually; the
+                              # error_summary.png always covers every series
+
+    QUANTILE_LEVELS = (0.1, 0.5, 0.9)
 
     # --- Replace with your real held-out data ---
     # contexts: (num_series, context_length)
@@ -167,12 +319,13 @@ if __name__ == "__main__":
         print("  OK: fine-tuned weights differ from base model.")
 
     print(f"\nComparing forecasts on {len(raw_X_val)} held-out series...")
-    base_errors, ft_errors = compare_forecasts(
+    base_errors, ft_errors, base_quantiles_all, ft_quantiles_all = compare_forecasts(
         base_pipeline,
         finetuned_pipeline,
         raw_X_val,
         raw_y_val,
         prediction_length=PREDICTION_LENGTH,
+        quantile_levels=QUANTILE_LEVELS,
     )
 
     print("\n--- Results (Mean Absolute Error) ---")
@@ -184,3 +337,20 @@ if __name__ == "__main__":
 
     num_improved = (ft_errors < base_errors).sum()
     print(f"Fine-tuned beat base model on {num_improved}/{len(base_errors)} series")
+
+    print(f"\nSaving plots to '{PLOT_DIR}/'...")
+    num_to_plot = min(MAX_SERIES_TO_PLOT, len(raw_X_val))
+    for i in range(num_to_plot):
+        path = plot_series_forecast(
+            context=np.asarray(raw_X_val[i], dtype=np.float32),
+            truth=np.asarray(raw_y_val[i], dtype=np.float32),
+            base_quantiles=base_quantiles_all[i],
+            ft_quantiles=ft_quantiles_all[i],
+            quantile_levels=QUANTILE_LEVELS,
+            series_idx=i,
+            out_dir=PLOT_DIR,
+        )
+    print(f"  Saved {num_to_plot} per-series forecast plots (e.g. '{path}')")
+
+    summary_path = plot_error_summary(base_errors, ft_errors, out_dir=PLOT_DIR)
+    print(f"  Saved error summary plot: '{summary_path}'")
