@@ -1,80 +1,106 @@
 """
-This script:
-  1. Loads the real Chronos2Pipeline.
-  2. Converts your numpy arrays into the dict/array input format the pipeline
-     actually accepts (no custom torch.utils.data.Dataset needed).
-  3. Calls pipeline.fit(..., finetune_mode="lora") with sane LoRA defaults.
-  4. Saves and reloads the fine-tuned pipeline (adapter weights only).
+DL_Choronotraining.py
 
+Fine-tunes Chronos-2 with LoRA on your real residual time series data
+(loaded via DL_training.py), replacing the original np.random.rand placeholders.
 
+Data flow
+---------
+DL_training.py produces:
+    DL.train        : (N_train, 500, 1)  float64  - residual series, padded+normalized
+    DL.validation   : (N_val,   500, 1)  float64
+    DL.train_target : (N_train,)         int      - class labels 0-3 (NOT used here)
+    DL.validation_target: same
+
+Chronos-2 fit() needs:
+    list of {"target": np.ndarray shape (500,)}  - flat 1D per series
+    No separate future-values array needed; fit() carves out the
+    prediction window internally from the context series.
+
+So the only transformation needed is: squeeze the trailing (,1) channel dim.
 """
 
 import torch
 import numpy as np
+from typing import Optional, Dict, Any, List
+
+# --- Import your real data pipeline ---
+# This runs DL_training.py's module-level code (loads zip/npy, pads,
+# normalizes, stratified-samples, splits into train/val/test arrays).
+# Make sure DL_training.py is in the same directory or on PYTHONPATH.
+import DL_training as DL
+
 from chronos import BaseChronosPipeline, Chronos2Pipeline
 
 
-
-def build_chronos2_inputs(raw_contexts: np.ndarray, raw_targets: np.ndarray):
+def build_chronos2_inputs(series_array: np.ndarray) -> List[Dict[str, np.ndarray]]:
     """
-    Convert plain (N, context_len) / (N, horizon) numpy arrays into the list-of-dict
-    format Chronos2Pipeline.fit() / .predict_quantiles() accept for univariate series.
+    Convert a (N, ts_len, 1) or (N, ts_len) numpy array into the
+    list-of-dict format Chronos2Pipeline.fit() expects.
 
-    Chronos-2's `fit` only needs the historical `target` per series; it learns to
-    predict the next `prediction_length` steps from context during training, so we
-    only pass `target` here (NOT future_values — fit handles the train/predict
-    split internally from context length and prediction_length).
+    fit() only needs the historical target per series — it learns to
+    predict the next `prediction_length` steps internally. Class labels
+    are not passed in here; Chronos-2 is fine-tuned as a forecaster,
+    not a classifier.
+
+    Args:
+        series_array: (N, ts_len[, 1]) array from DL_training.py
+
+    Returns:
+        list of {"target": (ts_len,) float32 array}, one per series
     """
-    
+    # squeeze trailing channel dim if present: (N, 500, 1) -> (N, 500)
+    if series_array.ndim == 3 and series_array.shape[2] == 1:
+        series_array = series_array.squeeze(-1)
+
     inputs = []
-    for i in range(len(raw_contexts)):
-        inputs.append({"target": np.asarray(raw_contexts[i], dtype=np.float32)})
+    for i in range(len(series_array)):
+        inputs.append({"target": np.asarray(series_array[i], dtype=np.float32)})
     return inputs
 
 
 def train_chronos2(
-    train_contexts,
-    train_targets,
-    val_contexts,
-    val_targets,
+    train_contexts: np.ndarray,
+    val_contexts: np.ndarray,
     model_name: str = "amazon/chronos-2",
-    prediction_length: int = 10,
+    prediction_length: int = 50,
     num_steps: int = 1000,
     learning_rate: float = 1e-4,
     batch_size: int = 32,
     finetune_mode: str = "lora",
-    lora_config: dict | None = None,
+    lora_config: Optional[Dict[str, Any]] = None,
     logging_steps: int = 100,
     save_dir: str = "chronos2_lora_adapter",
-    device_map: str | None = None,
-    context_length: int | None = None, #how much the data it looks at
-    
+    device_map: Optional[str] = None,
 ):
     """
-    Fine-tune Chronos-2 with LoRA using the pipeline's built-in `fit` method.
+    Fine-tune Chronos-2 with LoRA on real residual time series.
 
-    Note on validation: `fit()` evaluates every 100 steps when `validation_inputs`
-    is given, and automatically reloads the best (lowest eval_loss) checkpoint at
-    the end — that replaces the manual early-stopping/patience logic from the
-    original script. `num_steps` is the stopping criterion you control directly
-    (this is step-based, not epoch-based, since `fit` batches series randomly
-    rather than iterating a fixed-size DataLoader for a fixed number of epochs).
+    fit() is step-based (not epoch-based), evaluates every `logging_steps`
+    steps when validation_inputs is given, and automatically reloads the
+    best checkpoint at the end — no manual early stopping needed.
+
+    Args:
+        train_contexts : (N_train, ts_len[, 1]) array  - DL.train
+        val_contexts   : (N_val,   ts_len[, 1]) array  - DL.validation
+        prediction_length: how many steps ahead Chronos-2 learns to forecast.
+                           Set to ~10% of ts_len (500 steps -> 50 step horizon).
     """
     if device_map is None:
         device_map = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Loading Chronos-2 pipeline from '{model_name}' on device='{device_map}'...")
-    pipeline: Chronos2Pipeline = BaseChronosPipeline.from_pretrained(
+    pipeline = BaseChronosPipeline.from_pretrained(
         model_name,
         device_map=device_map,
     )
 
-    train_inputs = build_chronos2_inputs(train_contexts, train_targets)
-    val_inputs = build_chronos2_inputs(val_contexts, val_targets)
+    print(f"Building inputs from {len(train_contexts)} train / {len(val_contexts)} val series...")
+    train_inputs = build_chronos2_inputs(train_contexts)
+    val_inputs   = build_chronos2_inputs(val_contexts)
+    print(f"  Series length (context): {len(train_inputs[0]['target'])} steps")
+    print(f"  Prediction horizon:      {prediction_length} steps")
 
-    # Default LoRA config matches the package's own LoRA fine-tuning defaults
-    # (r=8, alpha=16, targeting the attention + output-projection layers) unless
-    # the caller overrides it.
     if lora_config is None:
         lora_config = {
             "r": 8,
@@ -112,34 +138,26 @@ def train_chronos2(
 
 if __name__ == "__main__":
 
-    # Simulated data — replace with your DL_training.py data pipeline.
-    # Shapes: (num_series, context_length) and (num_series, prediction_length).
-    # NOTE: fit() only consumes the historical `target` per series (see
-    # build_chronos2_inputs above) — the held-out future window is generated
-    # internally from context_length/prediction_length during training, so
-    # raw_y_train/raw_y_val aren't fed in directly. Keep them around if you need
-    # them for your own post-hoc evaluation against finetuned_pipeline.predict_*.
-    raw_X_train = np.random.rand(100, 50)
-    raw_y_train = np.random.rand(100, 10)
-    raw_X_val = np.random.rand(20, 50)
-    raw_y_val = np.random.rand(20, 10)
+    print(f"Train series:      {DL.train.shape}")       # (N, 500, 1)
+    print(f"Validation series: {DL.validation.shape}")  # (N, 500, 1)
+    print(f"Series length:     {DL.ts_len}")            # 500
+    print(f"Train class dist:  {np.bincount(DL.train_target)}")
 
-    PREDICTION_LENGTH = raw_y_train.shape[1]  # 10
+    # prediction_length: how many steps at the end of each 500-step series
+    # Chronos-2 learns to forecast. 50 = last 10% of the series, which
+    # covers the region closest to (or containing) the bifurcation point —
+    # the most informative part for early-warning signal research.
+    # Adjust if you want a longer/shorter forecast horizon.
+    PREDICTION_LENGTH = 50
 
     finetuned_pipeline = train_chronos2(
-        train_contexts=raw_X_train,
-        train_targets=raw_y_train,
-        val_contexts=raw_X_val,
-        val_targets=raw_y_val,
+        train_contexts=DL.train,
+        val_contexts=DL.validation,
         model_name="amazon/chronos-2",
         prediction_length=PREDICTION_LENGTH,
         num_steps=1000,
-        learning_rate=1e-4,   # 1e-5–1e-4 recommended for LoRA fine-tuning
+        learning_rate=1e-4,
         batch_size=32,
         finetune_mode="lora",
+        save_dir="chronos2_lora_adapter",
     )
-
-    # Example: use the fine-tuned pipeline for inference afterward
-    # quantiles, mean = finetuned_pipeline.predict_quantiles(
-    #     raw_X_val, prediction_length=PREDICTION_LENGTH, quantile_levels=[0.1, 0.5, 0.9]
-    # )

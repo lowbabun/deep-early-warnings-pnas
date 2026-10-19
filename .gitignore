@@ -1,10 +1,11 @@
-
 # Unnecessary file types
 .DS_store
 *.pyc
+__pycache__/
 
 # Virtual environment (user can build their own venv using requirements.txt)
 /venv
+.venv/
 
 # Output files from generation of training data (too large a file uploaded onto Zenodo))
 /training_data/output/*
@@ -19,17 +20,22 @@
 # these files are too large for github
 /test_empirical/thermoacoustic/data/thermo_experiments/
 
+# training results
+training_results_*.csv
+training_results_*.txt
 
-#training results
-dl_train/training_results_1_1.csv
-dl_train/training_results_1_1.txt
-training_results_1_1.csv
-training_results_1_1.txt
-
-# model checkpoints
-best_model.pth
+# model checkpoints and fine-tuned adapters
 *.pth
+chronos2_lora_adapter/
 
 # eval plots (also build artifacts)
-confusion_matrix.png
+confusion_matrix*.png
+timeseries_by_class*.png
 eval_plots/
+
+# generated porpoising series cache
+porpoising_cache/
+
+# residuals files
+residuals_pre_tipping.csv
+residuals_post_tipping.csv

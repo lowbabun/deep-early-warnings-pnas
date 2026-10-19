@@ -24,11 +24,12 @@ from datetime import datetime
 random.seed()
 
 # model_type
+# 0: no padding applied to time series (raw residual series used as-is)
 # 1: both left and right sides of time series are padded
 # 2: only left side of time series is padded
 
 # Get command line parameters
-model_type = 1
+model_type = 0
 kk = 1  # index for NN
 print("Train a classifier of type {} with index {}".format(model_type, kk))
 
@@ -45,6 +46,14 @@ f2_name = "training_results_{}_{}.csv".format(kk, model_type)
 f_results = open(f1_name, "w")
 f_results2 = open(f2_name, "w")
 
+
+if model_type == 0:
+    # No padding: use the full-length raw series unchanged. pad_left/pad_right
+    # stay at 0, which makes the padding loop below a no-op (pad_length =
+    # int(0 * random.uniform(0,1)) == 0 for every series) without needing a
+    # separate code path.
+    pad_left = 0
+    pad_right = 0
 
 if model_type == 1:
     pad_left = 225 if ts_len == 500 else 725
@@ -133,7 +142,8 @@ df_targets = df_targets_full
 df_groups = df_groups_full
 
 # Padding input sequences
-
+# With model_type=0, pad_left=pad_right=0 above, so pad_length is always 0
+# here and every series passes through unmodified (no zeroed-out region).
 for i, tsid in enumerate(tsid_vals):
     # for i in range(lib_size):
     pad_length = int(pad_left * random.uniform(0, 1))

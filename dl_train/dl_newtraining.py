@@ -3,7 +3,33 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
-import DL_training as DL
+from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
+import random
+# ── Data source options ──────────────────────────────────────────────────────
+# "library"    = existing dataset from DL_training.py
+# "may"        = May's harvesting model simulated through its fold (Fold-only series)
+# "porpoising" = toy F1 porpoising model (Hopf + Null series), see porpoising_ews.py
+# "both"       = library + may, "all" = library + may + porpoising, or any
+#                "+"-joined combination, e.g. "library+porpoising".
+# TRAIN_DATA controls train + validation, TEST_DATA controls the test set.
+TRAIN_DATA = "library"   # "library" | "may" | "porpoising" | "both" | "all" | "a+b"
+TEST_DATA = "may"        # same options as TRAIN_DATA
+N_MAY_SERIES = 2000       # May series simulated in total (split 80/10/10)
+N_PORP_SERIES = 2000      # porpoising series in total (half Hopf, half Null; split 80/10/10)
+from data_source import get_data
+DL = get_data(train_data=TRAIN_DATA, test_data=TEST_DATA,
+              n_may=N_MAY_SERIES, n_porp=N_PORP_SERIES)
+
+# --- Reproducibility ---
+# Fixes the random seed across torch/numpy/python's random module so that
+# repeated runs (e.g. when comparing hyperparameter changes) differ only
+# because of the change you made, not because of a different random init,
+# dropout mask sequence, or train_loader shuffle order.
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
 
 # hyperparameter settings
 CNN_layers = 1
@@ -18,6 +44,8 @@ mem_cells2 = 10
 kernel_size_param = 12
 epoch_param = 1500
 initializer_param = "lecun_normal"
+
+class_names = {0: "Fold", 1: "Hopf", 2: "Transcritical", 3: "Null"}
 
 
 
@@ -102,6 +130,31 @@ class testClassifier(nn.Module):
         x = self.final_dropout(x)
         return self.classifier(x)           # raw logits; CrossEntropyLoss applies softmax internally
 
+def lecun_normal_init(module):
+    """
+    LeCun-normal initialization: weights ~ N(0, 1/fan_in). This was
+    previously just a hyperparameter name (initializer_param) that was
+    never actually applied anywhere - PyTorch's default inits (Kaiming-
+    uniform-ish for Conv1d/Linear, uniform for LSTM) were silently running
+    instead. This wires it up for real so the PyTorch model's init matches
+    the intent of the Keras reference (lecun_normal).
+    """
+    if isinstance(module, (nn.Conv1d, nn.Linear)):
+        fan_in = module.weight.shape[1] * (module.weight.shape[2] if module.weight.dim() == 3 else 1)
+        std = (1.0 / fan_in) ** 0.5
+        nn.init.normal_(module.weight, mean=0.0, std=std)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LSTM):
+        for name, param in module.named_parameters():
+            if "weight_ih" in name or "weight_hh" in name:
+                fan_in = param.shape[1]
+                std = (1.0 / fan_in) ** 0.5
+                nn.init.normal_(param, mean=0.0, std=std)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
+
 model = testClassifier(
     seq_len=DL.ts_len,
     filters=filters_param,
@@ -111,6 +164,9 @@ model = testClassifier(
     lstm2_hidden=mem_cells2,
     dropout=dropout_percent,
 ).to(device)
+
+if initializer_param == "lecun_normal":
+    model.apply(lecun_normal_init)
 
 training_data = torch.tensor(DL.train, dtype=torch.float32).view(len(DL.train), DL.ts_len, 1)
 training_labels = torch.tensor(DL.train_target, dtype=torch.long)
@@ -130,7 +186,31 @@ train_dataset = TensorDataset(training_data, training_labels)
 train_loader = DataLoader(train_dataset, batch_size=batch_param, shuffle=True)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate_param, weight_decay=1e-5)
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+# Class-weighted loss: class 0 ("no bifurcation / stable") was completely
+# missed by this exact Conv1D+LSTM architecture in earlier runs (0/25
+# correct - see DL_ChronosClassifier.py comments). Weighting inversely by
+# class frequency in the training set pushes the optimizer to treat it
+# equally with the other classes rather than ignoring its harder signal.
+class_counts = np.bincount(DL.train_target, minlength=4)
+# Classes absent from the training set get weight 0 (not a huge weight, which
+# would push the model toward classes it never sees) and the rest are
+# normalised to average 1 over the classes actually present.
+_inv = np.where(class_counts > 0, 1.0 / np.maximum(class_counts, 1), 0.0)
+_inv = _inv / _inv.sum() * (class_counts > 0).sum()
+class_weights = torch.tensor(_inv, dtype=torch.float32)
+class_weights = class_weights.to(device)
+print(f"Training class counts: {dict(zip(class_names.values(), class_counts))}")
+print(f"Class weights: {class_weights.cpu().numpy().round(3)}")
+
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+
+# Decay LR when validation loss plateaus, rather than holding it fixed for
+# the entire 1500-epoch budget - lets training settle tighter near the end
+# instead of oscillating around a local minimum at a constant step size.
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="min", factor=0.5, patience=10
+)
 
 best_val_loss = float('inf')
 patience = 40  # was 10 - too tight given how noisy val loss is with only
@@ -157,6 +237,11 @@ for epoch in range(epoch_param):
         outputs = model(batch_X)
         loss = criterion(outputs, batch_y)
         loss.backward()
+        # Clip gradients before stepping - LSTMs are prone to exploding
+        # gradients over long sequences (250 timesteps post-pooling here),
+        # and this was already the practice in DL_ChronosClassifier.py's
+        # training loop but missing here.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
         epoch_loss += loss.item() * batch_X.size(0)
@@ -182,6 +267,8 @@ for epoch in range(epoch_param):
         val_outputs = model(val_X)
         val_loss = criterion(val_outputs, val_y).item()
         val_acc = (val_outputs.argmax(dim=1) == val_y).float().mean().item()
+
+    scheduler.step(val_loss)
 
     if val_loss < best_val_loss:
         # Save the best model state (based on raw validation loss, not training
@@ -211,10 +298,11 @@ for epoch in range(epoch_param):
 
     #Print every 10 epochs
     if (epoch + 1) % 10 == 0 or epoch == 0:
+        current_lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch+1}/{epoch_param} | Train Loss: {avg_loss:.4f} | Train Acc: {avg_acc:.4f} "
             f"| Val Loss: {val_loss:.4f} (smoothed: {smoothed_val_loss:.4f}) | Val Acc: {val_acc:.4f} "
-            f"| No improve: {epochs_no_improve}/{patience}"
+            f"| LR: {current_lr:.2e} | No improve: {epochs_no_improve}/{patience}"
         )
 
     if epochs_no_improve >= patience:
@@ -268,6 +356,35 @@ with torch.no_grad():
         else:
             print(f"  Class {c}: no test examples")
 
+    # --- F1 score (per-class, macro, weighted) ---
+    # Per-class: how well each individual bifurcation type is identified.
+    # Macro: unweighted mean across classes (treats Fold/Hopf/Transcritical/
+    #        Null equally regardless of test-set support).
+    # Weighted: mean weighted by class support - closer to overall accuracy
+    #           when classes are imbalanced.
+    labels_present = [c for c in range(num_classes) if class_totals[c] > 0]
+    target_names_present = [class_names[c] for c in labels_present]
+
+    per_class_f1 = f1_score(test_labels_np, test_preds, labels=labels_present, average=None, zero_division=0)
+    per_class_precision = precision_score(test_labels_np, test_preds, labels=labels_present, average=None, zero_division=0)
+    per_class_recall = recall_score(test_labels_np, test_preds, labels=labels_present, average=None, zero_division=0)
+    macro_f1 = f1_score(test_labels_np, test_preds, labels=labels_present, average="macro", zero_division=0)
+    weighted_f1 = f1_score(test_labels_np, test_preds, labels=labels_present, average="weighted", zero_division=0)
+
+    print("\nPer-class F1 (precision / recall / f1):")
+    for c, p, r, f in zip(labels_present, per_class_precision, per_class_recall, per_class_f1):
+        print(f"  Class {c} ({class_names[c]}): precision={p:.4f}  recall={r:.4f}  f1={f:.4f}")
+
+    print(f"\nMacro F1:    {macro_f1:.4f}")
+    print(f"Weighted F1: {weighted_f1:.4f}")
+
+    print("\nsklearn classification_report:")
+    print(classification_report(
+        test_labels_np, test_preds,
+        labels=labels_present, target_names=target_names_present,
+        zero_division=0,
+    ))
+
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
     # Panel 1: confusion matrix heatmap
@@ -288,19 +405,97 @@ with torch.no_grad():
                 color="white" if conf_matrix[i, j] > thresh else "black",
             )
 
-    # Panel 2: per-class accuracy bar chart
+    # Panel 2: per-class accuracy + F1 bar chart
     valid_classes = [c for c in range(num_classes) if class_totals[c] > 0]
     valid_accs = [per_class_acc[c] for c in valid_classes]
-    axes[1].bar([str(c) for c in valid_classes], valid_accs, color="tab:blue")
+    x = np.arange(len(valid_classes))
+    width = 0.35
+    axes[1].bar(x - width/2, valid_accs, width, color="tab:blue", label="Accuracy")
+    axes[1].bar(x + width/2, per_class_f1, width, color="tab:orange", label="F1")
     axes[1].set_ylim(0, 1)
     axes[1].set_xlabel("Class")
-    axes[1].set_ylabel("Accuracy")
-    axes[1].set_title("Per-class accuracy (test set)")
-    axes[1].axhline(test_accuracy, color="gray", linestyle="--", linewidth=1, label=f"Overall: {test_accuracy:.3f}")
-    axes[1].legend()
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([f"{c}\n({class_names[c]})" for c in valid_classes])
+    axes[1].set_ylabel("Score")
+    axes[1].set_title("Per-class accuracy & F1 (test set)")
+    axes[1].axhline(test_accuracy, color="gray", linestyle="--", linewidth=1, label=f"Overall acc: {test_accuracy:.3f}")
+    axes[1].axhline(macro_f1, color="darkred", linestyle=":", linewidth=1, label=f"Macro F1: {macro_f1:.3f}")
+    axes[1].legend(fontsize=8)
 
     fig.tight_layout()
     out_path = "confusion_matrix.png"
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     print(f"\nSaved confusion matrix plot to '{out_path}'")
+
+
+# ── Training-set evaluation + per-class example time series ─────────────────
+# Same idea as the test-set plot above (2 correct + 2 misclassified examples
+# per class, solid vs dashed lines), but run on the TRAINING set instead.
+# Useful for sanity-checking fit: if training-set examples are still being
+# misclassified in ways that look like the test-set failure modes, the model
+# is underfitting rather than overfitting; if training predictions look
+# near-perfect while test performance is much worse, that points to
+# overfitting/generalization gap instead.
+model.eval()
+train_eval_loader = DataLoader(
+    TensorDataset(training_data, training_labels), batch_size=batch_param, shuffle=False
+)
+train_preds_list = []
+with torch.no_grad():
+    for batch_X, _ in train_eval_loader:
+        batch_X = batch_X.to(device)
+        batch_preds = model(batch_X).argmax(dim=1).cpu().numpy()
+        train_preds_list.append(batch_preds)
+train_preds = np.concatenate(train_preds_list)
+train_labels_np = training_labels.numpy()
+train_accuracy = (train_preds == train_labels_np).mean()
+
+print("\n--- Training Set Evaluation (best checkpoint, eval mode) ---")
+print(f"Train Accuracy: {train_accuracy:.4f}")
+
+N_CORRECT_PER_CLASS = 2
+N_WRONG_PER_CLASS = 2
+
+fig3, axes3 = plt.subplots(num_classes, 1, figsize=(10, 3 * num_classes), sharex=True)
+if num_classes == 1:
+    axes3 = [axes3]
+
+for c in range(num_classes):
+    ax = axes3[c]
+    class_idx = np.where(train_labels_np == c)[0]
+
+    if len(class_idx) == 0:
+        ax.set_title(f"Class {c} ({class_names[c]}) — no training examples")
+        continue
+
+    correct_idx = class_idx[train_preds[class_idx] == c][:N_CORRECT_PER_CLASS]
+    wrong_idx = class_idx[train_preds[class_idx] != c][:N_WRONG_PER_CLASS]
+    chosen = np.concatenate([correct_idx, wrong_idx])
+
+    for i in chosen:
+        series = DL.train[i]                       # (ts_len, 1)
+        series = np.asarray(series).squeeze(-1)     # -> (ts_len,)
+        pred_c = train_preds[i]
+        correct = pred_c == c
+        ax.plot(
+            series,
+            alpha=0.8,
+            linewidth=1,
+            linestyle="-" if correct else "--",
+            label=f"idx {i} [{DL.train_source[i]}] ({'correct' if correct else f'pred={class_names[pred_c]}'})",
+        )
+
+    ax.set_title(
+        f"Class {c} ({class_names[c]}) — {len(class_idx)} training examples, "
+        f"showing {len(correct_idx)} correct + {len(wrong_idx)} wrong"
+    )
+    ax.set_ylabel("Residual value")
+    ax.legend(fontsize=7, loc="upper right")
+
+axes3[-1].set_xlabel("Timestep")
+fig3.suptitle("Example residual time series by true bifurcation class (training set)", y=1.0)
+fig3.tight_layout()
+fig3.savefig("timeseries_by_class_train.png", dpi=120)
+plt.close(fig3)
+print("Saved per-class example time series (training set) to 'timeseries_by_class_train.png'")

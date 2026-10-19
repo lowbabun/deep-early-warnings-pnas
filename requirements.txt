@@ -1,7 +1,53 @@
-ewstools>=2.1.2,<3.0
-scikit-learn>=1.6.1,<2.0
-pandas>=2.2.3,<3.0
-matplotlib>=3.9.4,<4.0
-plotly>=6.0.1,<7.0
-kaleido>=0.2.1,<1.0
-platformdirs>=4.3.7,<5.0
+# ── Core scientific stack ────────────────────────────────────────────────────
+numpy>=1.24,<3.0
+pandas>=2.2,<4.0
+scipy>=1.10,<2.0                # used in porpoising_ews.py (brentq root finding, gaussian_filter1d)
+statsmodels>=0.14,<1.0          # used in data_source.py / may_ews_simulation.py (lowess detrending)
+scikit-learn>=1.3,<2.0          # used in DL_training.py (classification_report etc.)
+matplotlib>=3.7,<4.0
+tqdm>=4.65,<5.0
+
+# ── Deep learning ────────────────────────────────────────────────────────────
+# PyTorch: install separately with the right CUDA wheel for your hardware.
+# On HPCC (CUDA 12.1):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Locally (CPU only):
+#   pip install torch
+# Minimum version needed for Conv1d + LSTM stack in dl_newtraining.py:
+torch>=2.0
+
+# TensorFlow/Keras: used in DL_training.py (Conv1D+LSTM Keras model).
+# Only needed if running DL_training.py directly, or if a training script uses
+# the "library" data source: data_source.py imports DL_training for that source,
+# which triggers the TF import even if you don't use the Keras model. Runs that
+# use only "may" and/or "porpoising" never import DL_training, so they don't
+# need TensorFlow.
+tensorflow>=2.12,<3.0
+
+# ── Chronos-2 + LoRA ─────────────────────────────────────────────────────────
+# chronos-forecasting 2.x is required — 1.x does not have Chronos2Pipeline.
+# The old chronos-forecasting==1.5.3 on the HPCC user install will cause
+# "cannot import name 'Chronos2Pipeline'" — upgrade inside your conda env:
+#   pip install "chronos-forecasting>=2.2" --upgrade
+chronos-forecasting>=2.2,<3.0
+
+# PEFT: LoRA adapter loading in DL_ChoronosEval.py and DL_ChronosClassifier.py
+peft>=0.9,<1.0
+
+# Required by chronos-forecasting and peft internally:
+transformers>=4.40,<5.0
+accelerate>=0.28,<2.0
+huggingface-hub>=0.25,<1.0
+safetensors>=0.4
+
+# pyyaml: needed by huggingface_hub — must be installed in the SAME environment
+# as huggingface_hub, not system-wide. On HPCC this caused the
+# "No module named 'yaml'" error when huggingface_hub was in ~/.local but
+# pyyaml was only in the system miniconda.
+pyyaml>=6.0
+
+# ── Removed from original requirements.txt ───────────────────────────────────
+# ewstools    : not imported in any current script
+# plotly      : not imported in any current script
+# kaleido     : not imported in any current script (plotly export helper)
+# platformdirs: not imported directly (pulled in transitively if needed)
